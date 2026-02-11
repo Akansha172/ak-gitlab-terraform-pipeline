@@ -1,0 +1,207 @@
+image: 
+    name: hashicorp/terraform:$TF_VERSION
+    entrypoint:
+      - "/usr/bin/env"
+      - "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+stages:
+  - apply_destroy
+  - apply
+  - apply_skipped
+  - apply_invalid
+
+apply_destroy:
+  stage: apply_destroy
+  manual_confirmation: "⚠️⚠️ 🔴🔴Destroy🔴🔴 ❌❌ has been detected in plan job, please review report.txt created in plan job. Make sure you have added variable 👉 APPLY_DESTROY=true , only true will be accepted, **Approve apply job further in this pipeline as well to actually perform apply. To cancel destory, add variable 🔘 APPLY_DESTROY=false"
+  rules:
+    - if: $DESTROYING == "true" && $CI_CHANGE == "true"
+      when: manual
+      changes:
+        - "*.tf"
+        - "**/*.tf"
+        - "**/*.tfvars"
+        - "**/.*-ci.yml"    
+    - if: $DESTROYING == "false" && $CI_CHANGE == "true"
+      when: never
+  script:
+    - |-
+      if [ -z "$APPLY_DESTROY" ]; then          # Accidental runs without approval, show warning
+        echo -e "\e[1;31m⚠️ APPLY_DESTROY variable is not set. Skipping terraform apply.\e[0m"
+        exit 33
+      elif [ "$APPLY_DESTROY" == true ]; then   # Destroy was approved, show warning
+        echo -e "\e[1;31m👍 APPLY_DESTROY variable set to true. Moving to apply.\e[0m"
+        echo "DESTROY_APPROVED=$APPLY_DESTROY" | tee -a $GITLAB_ENV >> build.env
+      elif [ "$APPLY_DESTROY" == false ]; then   # Destroy was not approved, show passed
+        echo -e "\e[1;31m❌ APPLY_DESTROY variable set to false, destroy was not approved. Skipping terraform apply.\nRerun this job APPLY_DESTROY=true if you want to approve it again\e[0m"
+        echo "DESTROY_APPROVED=$APPLY_DESTROY" | tee -a $GITLAB_ENV >> build.env
+        exit 0
+      elif [ "$APPLY_DESTROY" != true ] && [ "$APPLY_DESTROY" != false ]; then   # Wrong value set, show warning
+        echo -e "\e[1;31m❌ APPLY_DESTROY variable neither true nor false. Skipping terraform apply.\e[0m"
+        echo "DESTROY_APPROVED=$APPLY_DESTROY" | tee -a $GITLAB_ENV >> build.env
+        exit 11
+      elif [ "$CI_CHANGE" != true ]; then    # Approved but no changes, show warning
+        echo -e "\e[1;33m✅ No change detected, pipeline will stop here\e[0m"
+        exit 78
+      fi
+  allow_failure:
+    exit_codes: 
+      - 11
+      - 33
+      - 78
+  artifacts:
+    reports:
+      dotenv: build.env
+
+# 4️⃣ Apply
+apply:
+  stage: apply
+  needs:
+    - job: apply_destroy
+      optional: true
+      artifacts: true
+    - pipeline: $PARENT_PIPELINE_ID
+      job: plan
+      artifacts: true
+  manual_confirmation: "Review the report.txt created in plan job, and make sure to approve the apply job by adding variable 👉 APPLY=true , only true will be accepted. To cancel apply, add variable 🔘 APPLY=false"
+  rules:
+    - if: $CI_CHANGE == "true"
+      when: manual
+      changes:
+        - "*.tf"
+        - "**/*.tf"
+        - "**/*.tfvars"
+        - "**/.*-ci.yml"
+    - if: $CI_CHANGE == "false"
+      when: never
+  id_tokens:
+    WORKLOAD_IDENTITY_TOKEN:
+      aud: https://iam.googleapis.com/projects/99622839057/locations/global/workloadIdentityPools/org-wif-pool-prod-gitlab/providers/org-wif-provider-prod-gitlab
+  before_script:
+    - |-
+      echo $WORKLOAD_IDENTITY_TOKEN > $CI_BUILDS_DIR/.workload_identity.jwt
+      cat << EOF > $GOOGLE_APPLICATION_CREDENTIALS
+      {
+        "type": "external_account",
+        "audience": "//iam.googleapis.com/projects/$WORKLOAD_IDENTITY_PROJECT_NUMBER/locations/global/workloadIdentityPools/$WORKLOAD_IDENTITY_POOL/providers/$WORKLOAD_IDENTITY_PROVIDER",
+        "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+        "token_url": "https://sts.googleapis.com/v1/token",
+        "credential_source": {
+          "file": "$CI_BUILDS_DIR/.workload_identity.jwt"
+        },
+        "service_account_impersonation_url": "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/$SERVICE_ACCOUNT:generateAccessToken"
+      }
+      EOF
+  script:
+    - |-
+      echo "$CI_CHANGE"
+      echo "$DESTROYING"
+      if [ -z "$APPLY" ]; then          # Accidental runs without approval, show warning
+        echo -e "\e[1;31m⚠️ APPLY variable is not set. Skipping terraform apply.\e[0m"
+        exit 33
+      elif [ "$APPLY" == false ]; then   # Not approved, show passed
+        echo -e "\e[1;31m❌ APPLY variable set to false. Apply was not approved. Skipping terraform apply.\e[0m"
+        exit 0
+      elif [ "$APPLY" != true ] && [ "$APPLY" != false ]; then   # Wrong value set, show warning
+        echo -e "\e[1;31m❌ APPLY variable neither true nor false. Skipping terraform apply.\e[0m"
+        exit 11
+      elif [ "$CI_CHANGE" != true ]; then    # Approved but no changes, show warning
+        echo -e "\e[1;33m✅ No change detected, pipeline will stop here\e[0m"
+        exit 78
+      fi
+      echo "$DESTROY_APPROVED"
+      if [ "$DESTROYING" == true ]; then
+        if [ -z "$DESTROY_APPROVED" ]; then
+          echo -e "\e[1;31m⚠️Destroy was detected but wasn't approved properly by setting var APPLY_DESTROY=true , approve destroy and re-run this job. Skipping terraform apply.\e[0m"
+          exit 33
+        elif [ "$DESTROY_APPROVED" == false ]; then   # Apply was approved but Destroy not approved
+          echo -e "\e[1;31m⚠️Destroy was detected and wasn't approved, approve destroy and re-run this job. Skipping terraform apply.\e[0m"
+          exit 11
+        elif [ "$DESTROY_APPROVED" != true ] && [ "$DESTROY_APPROVED" != false ]; then   # Wrong value set, show warning
+          echo -e "\e[1;31m❌ APPLY_DESTROY variable was neither true nor false in apply_destroy job, approve destroy and re-run this job Skipping terraform apply.\e[0m"
+          exit 11
+        fi
+      fi
+
+      apk add gawk
+
+      # File containing the list of directories
+      export DIR_FILE="$TF_TARGET_DIR/changed_dirs.txt"
+      export SORTED_FILE="$TF_TARGET_DIR/sorted_dirs.txt"
+      export TMP_FILE="$TF_TARGET_DIR/changed_dirs.tmp"
+
+      touch $SORTED_FILE
+      touch $TMP_FILE
+      sort -u "$DIR_FILE" > "$TMP_FILE"
+
+      # Ensure ou/gcp-folder is first
+      if grep -q "ou/gcp-folder" "$TMP_FILE"; then
+        grep "ou/gcp-folder" "$TMP_FILE" >> "$SORTED_FILE"
+      fi
+
+      # Ensure ou/gcp-project is second
+      if grep -q "ou/gcp-project" "$TMP_FILE"; then
+        grep "ou/gcp-project" "$TMP_FILE" >> "$SORTED_FILE"
+      fi
+
+      # Ignore exit codes temporarily, Process remaining directories in order
+      set +e
+      {
+        grep "ou/" "$TMP_FILE" 2>/dev/null
+        grep "networking" "$TMP_FILE" 2>/dev/null
+        grep "iam" "$TMP_FILE" 2>/dev/null
+        grep "storage" "$TMP_FILE" 2>/dev/null
+        grep "compute" "$TMP_FILE" 2>/dev/null
+        grep -v -e "ou/" -e "networking" -e "iam" -e "storage" -e "compute" "$TMP_FILE" 2>/dev/null
+      } | grep -v -e "ou/gcp-folder" -e "ou/gcp-project" 2>/dev/null | awk '!seen[$0]++' >> "$SORTED_FILE"
+      set -e
+
+      # Read directories line by line
+      while IFS= read -r dir; do
+        # Skip empty lines
+        [[ -z "$dir" ]] && continue
+
+        echo -e "\e[1;33m📁 Entering directory: $dir\e[0m"
+        cd "$dir"
+        terraform apply --auto-approve -input=false tfplan
+        # Return to the original directory
+        cd - > /dev/null
+
+      done < "$SORTED_FILE"
+
+  allow_failure:
+    exit_codes: 
+      - 11
+      - 33
+      - 78
+  artifacts:
+    paths:
+      - $TF_TARGET_DIR/*dirs.*
+
+apply_skipped:
+  stage: apply_skipped
+  rules:
+    - if: $CI_CHANGE == "false"
+      changes:
+        - "*.tf"
+        - "**/*.tf"
+        - "**/*.tfvars"
+        - "**/.*-ci.yml"
+  script: 
+    - |-
+      echo "Skipping..."
+      echo -e "\e[1;33m✅ No change detected, apply has been skipped\e[0m"
+
+apply_invalid:
+  stage: apply_invalid
+  rules: 
+    - if: $CI_CHANGE != "true" && $CI_CHANGE != "false"
+      changes:
+        - "*.tf"
+        - "**/*.tf"
+        - "**/*.tfvars"
+        - "**/.*-ci.yml"
+  script:
+    - |-
+      echo
+      echo -e "\e[1;31m ⚠️ Variable CI_CHANGE not set properly, check plan job for more details\e[0m"
+      exit 1

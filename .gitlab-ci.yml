@@ -1,0 +1,220 @@
+workflow:
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master-prod"
+      variables:
+        TF_TARGET_DIR: "$CI_PROJECT_DIR/environments/prod"
+    - if: $CI_COMMIT_BRANCH == "master-dev"
+      variables:
+        TF_TARGET_DIR: "$CI_PROJECT_DIR/environments/dev"
+
+image: 
+    name: hashicorp/terraform:$TF_VERSION
+    entrypoint:
+      - "/usr/bin/env"
+      - "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+stages:
+  - init-validate
+  - plan
+  - check_changes
+
+variables:
+  TF_VERSION: "1.11.0"
+  WORKLOAD_IDENTITY_PROJECT_NUMBER: <project-number> # org-shared-services-01 
+  WORKLOAD_IDENTITY_POOL: org-wif-pool-prod-gitlab
+  WORKLOAD_IDENTITY_PROVIDER: org-wif-provider-prod-gitlab
+  SERVICE_ACCOUNT: org-sa-tf-gitlab@org-shared-services-01.iam.gserviceaccount.com
+  GOOGLE_APPLICATION_CREDENTIALS: $CI_BUILDS_DIR/.workload_identity.wlconfig
+
+# Cache files between jobs
+cache:
+  key: "$CI_COMMIT_SHA"
+  paths:
+    - "$TF_TARGET_DIR/**/.terraform"
+    - "$TF_TARGET_DIR/**/.terraform.lock.hcl"
+
+# 1️⃣ Format, Init, Validate
+init-validate:
+  stage: init-validate
+  rules:
+    - changes:
+        - "*.tf"
+        - "**/*.tf"
+        - "**/*.tfvars"
+        - "**/.*-ci.yml" 
+  id_tokens:
+    WORKLOAD_IDENTITY_TOKEN:
+      aud: https://iam.googleapis.com/projects/<project-number>/locations/global/workloadIdentityPools/org-wif-pool-prod-gitlab/providers/org-wif-provider-prod-gitlab
+  before_script:
+    - |-
+      echo $WORKLOAD_IDENTITY_TOKEN > $CI_BUILDS_DIR/.workload_identity.jwt
+      cat << EOF > $GOOGLE_APPLICATION_CREDENTIALS
+      {
+        "type": "external_account",
+        "audience": "//iam.googleapis.com/projects/$WORKLOAD_IDENTITY_PROJECT_NUMBER/locations/global/workloadIdentityPools/$WORKLOAD_IDENTITY_POOL/providers/$WORKLOAD_IDENTITY_PROVIDER",
+        "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+        "token_url": "https://sts.googleapis.com/v1/token",
+        "credential_source": {
+          "file": "$CI_BUILDS_DIR/.workload_identity.jwt"
+        },
+        "service_account_impersonation_url": "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/$SERVICE_ACCOUNT:generateAccessToken"
+      }
+      EOF
+  script:
+    - |-
+      apk --no-cache add jq
+      echo $WORKLOAD_IDENTITY_TOKEN | jq -R 'split(".") | .[1] | @base64d | fromjson'
+      # Extract TF_DIRS
+      export TF_DIRS=$(find $TF_TARGET_DIR -type f -name '*.tf' ! -path '*/.terraform/*' | xargs -n1 dirname | sort -u | jq -R -s -c 'split("\n")[:-1]')
+      
+      # Traverse TF_DIRS
+      for dir in $(echo $TF_DIRS | jq -r '.[]'); do
+        dir=$(echo "$dir" | tr -d '\r') # clean dir value
+        echo -e "\e[1;33m🔍 Formatting, Init and validating $dir\e[0m"
+        cd $dir
+        terraform fmt
+        terraform init
+        terraform validate
+        cd - > /dev/null
+      done
+
+# 2️⃣ Plan
+plan:
+  stage: plan
+  dependencies:
+    - init-validate
+  rules:
+    - changes:
+        - "*.tf"
+        - "**/*.tf"
+        - "**/*.tfvars"
+        - "**/.*-ci.yml"    
+  id_tokens:
+    WORKLOAD_IDENTITY_TOKEN:
+      aud: https://iam.googleapis.com/projects/<project-number>/locations/global/workloadIdentityPools/org-wif-pool-prod-gitlab/providers/org-wif-provider-prod-gitlab
+  before_script:
+    - |-
+      echo $WORKLOAD_IDENTITY_TOKEN > $CI_BUILDS_DIR/.workload_identity.jwt
+      cat << EOF > $GOOGLE_APPLICATION_CREDENTIALS
+      {
+        "type": "external_account",
+        "audience": "//iam.googleapis.com/projects/$WORKLOAD_IDENTITY_PROJECT_NUMBER/locations/global/workloadIdentityPools/$WORKLOAD_IDENTITY_POOL/providers/$WORKLOAD_IDENTITY_PROVIDER",
+        "subject_token_type": "urn:ietf:params:oauth:token-type:jwt",
+        "token_url": "https://sts.googleapis.com/v1/token",
+        "credential_source": {
+          "file": "$CI_BUILDS_DIR/.workload_identity.jwt"
+        },
+        "service_account_impersonation_url": "https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/$SERVICE_ACCOUNT:generateAccessToken"
+      }
+      EOF
+  script:
+    - |-
+      apk --no-cache add jq
+      # Extract TF_DIRS
+      export TF_DIRS=$(find $TF_TARGET_DIR -type f -name '*.tf' ! -path '*/.terraform/*' | xargs -n1 dirname | sort -u | jq -R -s -c 'split("\n")[:-1]')
+            
+      # Traverse TF_DIRS and perform plan while extracting plan and output
+      export DESTROYING=false
+      changed_dirs=""
+      for dir in $(echo $TF_DIRS | jq -r '.[]'); do
+        
+        dir=$(echo "$dir" | tr -d '\r') # clean dir value
+        echo -e "\e[1;33m🧠 Planning in $dir\e[0m"
+        cd $dir
+        
+        # Ignore exit codes temporarily, extract plan output and exitcode using tmpfile
+        set +e
+        tmpfile=$(mktemp) || exit 1
+        terraform plan -out="tfplan" -detailed-exitcode > "$tmpfile" 2>&1
+        exit_code=$?
+        set -e
+        cat "$tmpfile" | tee output.txt
+        rm -f "$tmpfile"
+        
+        
+        if [ $exit_code -eq 1 ]; then                     # Exit if plan failed
+        
+          echo -e "\e[1;31m⚠️Plan failed\e[0m"
+          exit 1
+        
+        elif [ $exit_code -eq 2 ]; then                   # Changes detected
+          
+          # Create Report
+          # Check if tfplan exists, then generate tfplan.json
+          [ -f tfplan ] && terraform show -json tfplan > tfplan.json || true
+
+          # If tfplan.json exists, create tfplan.txt with resource change counts
+          [ -f tfplan.json ] && jq -r '
+            {
+              "add": [.resource_changes[] | select(.change.actions[] == "create")] | length,
+              "change": [.resource_changes[] | select(.change.actions[] == "update")] | length,
+              "destroy": [.resource_changes[] | select(.change.actions[] == "delete")] | length
+            } |
+            "    🟢add:     \( .add )\n    🟡change:  \( .change )\n    🔴destroy: \( .destroy )"' tfplan.json > tfplan.txt || true
+
+          # Append the summary to report
+          [ -f tfplan.txt ] && echo -e "\n\n✅ Changes detected in: $dir -" >> $TF_TARGET_DIR/report.txt && cat tfplan.txt >> $TF_TARGET_DIR/report.txt || true
+
+          # Append dir to list of changed_dirs
+          changed_dirs="$changed_dirs"$'\n'"$dir"
+
+          # Set DESTROYING true if destroy is detected in plan
+          if [ -f tfplan.txt ]; then
+            grep -q "destroy: 0" tfplan.txt || export DESTROYING=true || true
+          fi
+
+        fi
+        
+
+        # cd to previous dir
+        cd - > /dev/null
+      done
+
+
+      if [ -n "$changed_dirs" ]; then 
+        {
+          echo -e "\n\n ---------------------------------------------------\n\nSummary:"
+          echo "✅ Changes detected in:"
+          echo "$changed_dirs" | while IFS= read -r dir; do
+            echo "$dir"
+          done
+        } >> $TF_TARGET_DIR/report.txt
+        echo "$changed_dirs" > $TF_TARGET_DIR/changed_dirs.txt
+        echo "CI_CHANGE=true" | tee -a $GITLAB_ENV >> build.env
+        echo "DESTROYING=$DESTROYING" | tee -a $GITLAB_ENV >> build.env
+        echo "TF_TARGET_DIR=$TF_TARGET_DIR" | tee -a $GITLAB_ENV >> build.env
+      else
+        echo "☑️ No changes detected, apply job will not run" > $TF_TARGET_DIR/report.txt
+        echo "CI_CHANGE=false" | tee -a $GITLAB_ENV >> build.env
+      fi
+      cat $TF_TARGET_DIR/report.txt
+      [ "$DESTROYING" == true ] && echo -e "\e[1;31m‼️ Destroy has been planned, please check the $TF_TARGET_DIR/report.txt\e[0m" || true
+  artifacts:
+    paths:
+      - $TF_TARGET_DIR/**/tfplan
+      - $TF_TARGET_DIR/**/tfplan.json
+      - $TF_TARGET_DIR/**/tfplan.txt
+      - $TF_TARGET_DIR/**/output.txt
+      - $TF_TARGET_DIR/report.txt
+      - $TF_TARGET_DIR/changed_dirs.txt
+      - "$TF_TARGET_DIR/**/.terraform"
+      - "$TF_TARGET_DIR/**/.terraform.lock.hcl"
+    reports:
+      dotenv: build.env
+
+check_changes:
+  stage: check_changes
+  variables:
+    PARENT_PIPELINE_ID: $CI_PIPELINE_ID
+    CI_CHANGE: $CI_CHANGE
+    DESTROYING: $DESTROYING
+    TF_TARGET_DIR: $TF_TARGET_DIR
+  rules:
+    - changes:
+        - "*.tf"
+        - "**/*.tf"
+        - "**/*.tfvars"
+        - "**/.*-ci.yml" 
+  trigger:
+    include: .apply-ci.yml
+
